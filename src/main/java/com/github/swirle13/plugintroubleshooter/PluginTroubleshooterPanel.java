@@ -49,7 +49,6 @@ import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.SwingUtilities;
-import javax.swing.SwingWorker;
 import javax.swing.border.EmptyBorder;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
@@ -64,8 +63,10 @@ import net.runelite.client.plugins.PluginDependency;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.PluginInstantiationException;
 import net.runelite.client.plugins.PluginManager;
+import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.FontManager;
+import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.ui.PluginPanel;
 import net.runelite.client.util.LinkBrowser;
 
@@ -114,6 +115,7 @@ class PluginTroubleshooterPanel extends PluginPanel
 	private final EventBus eventBus;
 	private final ConfigManager configManager;
 	private final PluginTroubleshooterConfig config;
+	private final ClientToolbar clientToolbar;
 
 	// -- Layout --
 
@@ -135,9 +137,16 @@ class PluginTroubleshooterPanel extends PluginPanel
 	 */
 	private volatile boolean operationInProgress;
 
+	/**
+	 * The navigation button for this panel, used to re-focus the panel
+	 * after plugin operations that may shift the sidebar selection.
+	 */
+	private NavigationButton navButton;
+
 	@Inject
 	PluginTroubleshooterPanel(PluginManager pluginManager, EventBus eventBus,
-		ConfigManager configManager, PluginTroubleshooterConfig config)
+		ConfigManager configManager, PluginTroubleshooterConfig config,
+		ClientToolbar clientToolbar)
 	{
 		super(false);
 
@@ -145,6 +154,7 @@ class PluginTroubleshooterPanel extends PluginPanel
 		this.eventBus = eventBus;
 		this.configManager = configManager;
 		this.config = config;
+		this.clientToolbar = clientToolbar;
 
 		setLayout(new BorderLayout());
 		setBackground(ColorScheme.DARK_GRAY_COLOR);
@@ -172,6 +182,15 @@ class PluginTroubleshooterPanel extends PluginPanel
 			rebuildIdleCard();
 			showCard(CARD_IDLE);
 		}
+	}
+
+	/**
+	 * Sets the navigation button reference so the panel can re-focus
+	 * itself after plugin operations that shift the sidebar.
+	 */
+	void setNavigationButton(NavigationButton navButton)
+	{
+		this.navButton = navButton;
 	}
 
 	/**
@@ -347,6 +366,7 @@ class PluginTroubleshooterPanel extends PluginPanel
 		}
 
 		List<Plugin> candidates = collectCandidates();
+		log.debug("Starting troubleshooter session with {} candidates", candidates.size());
 
 		Map<Plugin, Boolean> snapshot = new LinkedHashMap<>();
 		for (Plugin plugin : pluginManager.getPlugins())
@@ -355,6 +375,8 @@ class PluginTroubleshooterPanel extends PluginPanel
 		}
 
 		session = new TroubleshooterSession(candidates, snapshot);
+		log.debug("Session created: state={}, suspects={}, totalSteps={}",
+			session.getState(), session.getSuspects().size(), session.getTotalSteps());
 
 		// Save plugin states for recovery in case of interruption
 		savePluginStatesToConfig(snapshot);
@@ -368,7 +390,7 @@ class PluginTroubleshooterPanel extends PluginPanel
 			return;
 		}
 
-		runPluginOpsInBackground(
+		runPluginOps(
 			this::applySessionStep,
 			() ->
 			{
@@ -383,6 +405,7 @@ class PluginTroubleshooterPanel extends PluginPanel
 		{
 			return;
 		}
+		log.debug("User reported bad: step={}, low={}, high={}", session.getStep(), session.getLow(), session.getHigh());
 		session.reportBad();
 		afterAdvance();
 	}
@@ -393,16 +416,19 @@ class PluginTroubleshooterPanel extends PluginPanel
 		{
 			return;
 		}
+		log.debug("User reported good: step={}, low={}, high={}", session.getStep(), session.getLow(), session.getHigh());
 		session.reportGood();
 		afterAdvance();
 	}
 
 	private void afterAdvance()
 	{
+		log.debug("After advance: state={}, low={}, high={}", session.getState(), session.getLow(), session.getHigh());
 		switch (session.getState())
 		{
 			case FOUND:
-				runPluginOpsInBackground(
+				log.info("Troubleshooter found culprit: {}", session.getResult().getName());
+				runPluginOps(
 					() -> restoreExcept(session.getResult()),
 					() ->
 					{
@@ -413,7 +439,7 @@ class PluginTroubleshooterPanel extends PluginPanel
 				break;
 
 			case NOT_FOUND:
-				runPluginOpsInBackground(
+				runPluginOps(
 					this::restoreAll,
 					() ->
 					{
@@ -429,7 +455,7 @@ class PluginTroubleshooterPanel extends PluginPanel
 				break;
 
 			default:
-				runPluginOpsInBackground(
+				runPluginOps(
 					this::applySessionStep,
 					() ->
 					{
@@ -450,7 +476,7 @@ class PluginTroubleshooterPanel extends PluginPanel
 		if (session != null)
 		{
 			session.cancel();
-			runPluginOpsInBackground(
+			runPluginOps(
 				this::restoreAll,
 				() ->
 				{
@@ -482,7 +508,7 @@ class PluginTroubleshooterPanel extends PluginPanel
 			return;
 		}
 
-		runPluginOpsInBackground(
+		runPluginOps(
 			this::restoreAll,
 			() ->
 			{
@@ -568,6 +594,8 @@ class PluginTroubleshooterPanel extends PluginPanel
 		int mid = session.getMid();
 		List<Plugin> suspects = session.getSuspects();
 
+		log.debug("Applying bisect step {}: low={}, high={}, mid={}", session.getStep(), low, high, mid);
+
 		for (int i = 0; i < suspects.size(); i++)
 		{
 			Plugin plugin = suspects.get(i);
@@ -609,6 +637,7 @@ class PluginTroubleshooterPanel extends PluginPanel
 			return;
 		}
 
+		log.debug("Restoring all plugin states");
 		for (Map.Entry<Plugin, Boolean> entry : session.getOriginalStates().entrySet())
 		{
 			boolean wasEnabled = entry.getValue();
@@ -628,6 +657,7 @@ class PluginTroubleshooterPanel extends PluginPanel
 			return;
 		}
 
+		log.debug("Restoring all plugin states except: {}", exclude.getName());
 		for (Map.Entry<Plugin, Boolean> entry : session.getOriginalStates().entrySet())
 		{
 			Plugin plugin = entry.getKey();
@@ -650,37 +680,36 @@ class PluginTroubleshooterPanel extends PluginPanel
 	}
 
 	/**
-	 * Runs plugin operations on a background thread to avoid blocking the EDT,
-	 * then executes the given callback on the EDT when complete.
-	 * Sets {@link #operationInProgress} to prevent re-entrant clicks.
+	 * Runs plugin operations on the EDT (required by PluginManager), then
+	 * executes the given follow-up. Sets {@link #operationInProgress} to
+	 * prevent re-entrant clicks during the operation.
 	 */
-	private void runPluginOpsInBackground(Runnable pluginOps, Runnable edtCallback)
+	private void runPluginOps(Runnable pluginOps, Runnable followUp)
 	{
 		operationInProgress = true;
-		new SwingWorker<Void, Void>()
+		try
 		{
-			@Override
-			protected Void doInBackground()
-			{
-				pluginOps.run();
-				return null;
-			}
+			pluginOps.run();
+		}
+		catch (Exception e)
+		{
+			log.warn("Plugin operation failed", e);
+		}
+		finally
+		{
+			operationInProgress = false;
+		}
 
-			@Override
-			protected void done()
-			{
-				try
-				{
-					get();
-				}
-				catch (Exception e)
-				{
-					log.warn("Background plugin operation failed", e);
-				}
-				operationInProgress = false;
-				edtCallback.run();
-			}
-		}.execute();
+		followUp.run();
+
+		// Re-focus this panel after all pending EDT events settle.
+		// Stopping plugins with sidebar panels removes their nav buttons,
+		// which queues selection-change events that override the current panel.
+		// invokeLater ensures we run after those events have been processed.
+		if (navButton != null)
+		{
+			SwingUtilities.invokeLater(() -> clientToolbar.openPanel(navButton));
+		}
 	}
 
 	private void setPluginState(Plugin plugin, boolean enabled)
@@ -696,12 +725,13 @@ class PluginTroubleshooterPanel extends PluginPanel
 			{
 				pluginManager.stopPlugin(plugin);
 			}
+			log.debug("{} plugin: {}", enabled ? "Started" : "Stopped", plugin.getName());
 		}
 		catch (PluginInstantiationException e)
 		{
 			log.warn("Failed to {} plugin {} during troubleshoot",
 				enabled ? "start" : "stop",
-				plugin.getClass().getSimpleName(), e);
+				plugin.getName(), e);
 		}
 	}
 
@@ -748,7 +778,7 @@ class PluginTroubleshooterPanel extends PluginPanel
 				+ "How it works:<br>"
 				+ "1. Some plugins will be temporarily disabled<br>"
 				+ "2. You check if the issue still occurs<br>"
-				+ "3. We repeat until the culprit is found</html>"));
+				+ "3. Repeat until the culprit is found</html>"));
 		panel.add(Box.createVerticalStrut(16));
 
 		List<Plugin> candidates = collectCandidates();

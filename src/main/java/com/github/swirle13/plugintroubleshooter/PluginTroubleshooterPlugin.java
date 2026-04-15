@@ -71,6 +71,7 @@ public class PluginTroubleshooterPlugin extends Plugin
 			.build();
 
 		clientToolbar.addNavigation(navButton);
+		panel.setNavigationButton(navButton);
 		panel.registerEventBus();
 	}
 
