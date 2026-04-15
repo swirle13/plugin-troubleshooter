@@ -124,7 +124,7 @@ class TroubleshooterSession
 	}
 
 	/**
-	 * Returns the plugins that should remain <b>enabled</b> for the current step.
+	 * Returns the plugins that should remain enabled for the current step.
 	 * This is the first half of the current range: {@code [low, mid]}.
 	 */
 	List<Plugin> getEnabledHalf()
@@ -133,7 +133,7 @@ class TroubleshooterSession
 	}
 
 	/**
-	 * Returns the plugins that should be <b>disabled</b> for the current step.
+	 * Returns the plugins that should be disabled for the current step.
 	 * This is the second half of the current range: {@code (mid, high]}.
 	 */
 	List<Plugin> getDisabledHalf()
@@ -142,7 +142,7 @@ class TroubleshooterSession
 	}
 
 	/**
-	 * The user reports the issue <b>still occurs</b>.
+	 * The user reports the issue still occurs.
 	 * The offending plugin is in the currently-enabled half.
 	 */
 	void reportBad()
@@ -153,7 +153,7 @@ class TroubleshooterSession
 	}
 
 	/**
-	 * The user reports the issue is <b>gone</b>.
+	 * The user reports the issue is gone.
 	 * The offending plugin is in the currently-disabled half.
 	 */
 	void reportGood()

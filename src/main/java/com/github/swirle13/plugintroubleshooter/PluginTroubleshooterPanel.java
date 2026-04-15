@@ -31,8 +31,9 @@ import java.awt.Dimension;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
+import java.lang.reflect.Type;
 import java.util.Arrays;
-import java.util.HashSet;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -46,8 +47,14 @@ import javax.swing.BoxLayout;
 import javax.swing.JButton;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
+import javax.swing.JScrollPane;
+import javax.swing.SwingUtilities;
+import javax.swing.SwingWorker;
 import javax.swing.border.EmptyBorder;
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ProfileChanged;
@@ -94,10 +101,19 @@ class PluginTroubleshooterPanel extends PluginPanel
 	private static final Color COLOR_PROGRESS_BG = ColorScheme.DARKER_GRAY_COLOR;
 	private static final Color COLOR_PROGRESS_FG = ColorScheme.BRAND_ORANGE;
 
+	// -- Config keys for internal state --
+
+	private static final String CONFIG_GROUP = "plugin-troubleshooter";
+	private static final String CONFIG_KEY_SAVED_STATES = "savedPluginStates";
+
+	private static final Gson GSON = new Gson();
+
 	// -- Dependencies --
 
 	private final PluginManager pluginManager;
 	private final EventBus eventBus;
+	private final ConfigManager configManager;
+	private final PluginTroubleshooterConfig config;
 
 	// -- Layout --
 
@@ -113,13 +129,22 @@ class PluginTroubleshooterPanel extends PluginPanel
 
 	private TroubleshooterSession session;
 
+	/**
+	 * Guard flag to prevent re-entrant clicks while plugin operations
+	 * are running on a background thread.
+	 */
+	private volatile boolean operationInProgress;
+
 	@Inject
-	PluginTroubleshooterPanel(PluginManager pluginManager, EventBus eventBus)
+	PluginTroubleshooterPanel(PluginManager pluginManager, EventBus eventBus,
+		ConfigManager configManager, PluginTroubleshooterConfig config)
 	{
 		super(false);
 
 		this.pluginManager = pluginManager;
 		this.eventBus = eventBus;
+		this.configManager = configManager;
+		this.config = config;
 
 		setLayout(new BorderLayout());
 		setBackground(ColorScheme.DARK_GRAY_COLOR);
@@ -131,6 +156,10 @@ class PluginTroubleshooterPanel extends PluginPanel
 
 		buildIdleCard();
 		showCard(CARD_IDLE);
+
+		// Defer recovery so it doesn't run during Guice injection when
+		// PluginManager may not be in a stable state (re-entrancy hazard).
+		SwingUtilities.invokeLater(this::recoverFromInterruptedSession);
 	}
 
 	// -- Panel lifecycle --
@@ -138,8 +167,6 @@ class PluginTroubleshooterPanel extends PluginPanel
 	@Override
 	public void onActivate()
 	{
-		eventBus.register(this);
-
 		if (session == null)
 		{
 			rebuildIdleCard();
@@ -147,8 +174,21 @@ class PluginTroubleshooterPanel extends PluginPanel
 		}
 	}
 
-	@Override
-	public void onDeactivate()
+	/**
+	 * Registers the panel with the EventBus. Called by the plugin's
+	 * {@code startUp()} so that events are received regardless of
+	 * whether the panel tab is currently visible.
+	 */
+	void registerEventBus()
+	{
+		eventBus.register(this);
+	}
+
+	/**
+	 * Unregisters the panel from the EventBus. Called by the plugin's
+	 * {@code shutDown()}.
+	 */
+	void unregisterEventBus()
 	{
 		eventBus.unregister(this);
 	}
@@ -177,10 +217,135 @@ class PluginTroubleshooterPanel extends PluginPanel
 		}
 	}
 
+	// -- Session recovery failsafe --
+
+	/**
+	 * Checks if there was an incomplete troubleshooting session and restores plugin states.
+	 * This handles the case where the application exited during troubleshooting.
+	 */
+	private void recoverFromInterruptedSession()
+	{
+		String savedStates = configManager.getConfiguration(CONFIG_GROUP, CONFIG_KEY_SAVED_STATES);
+		if (savedStates == null || savedStates.isEmpty())
+		{
+			return;
+		}
+
+		log.info("Recovering from interrupted troubleshooting session");
+
+		try
+		{
+			Map<String, Boolean> states = parsePluginStates(savedStates);
+			restorePluginStatesFromMap(states);
+			configManager.unsetConfiguration(CONFIG_GROUP, CONFIG_KEY_SAVED_STATES);
+			log.info("Successfully restored {} plugins", states.size());
+		}
+		catch (Exception e)
+		{
+			log.warn("Failed to recover plugin states", e);
+			configManager.unsetConfiguration(CONFIG_GROUP, CONFIG_KEY_SAVED_STATES);
+		}
+	}
+
+	/**
+	 * Saves the current plugin states to config for recovery in case of interruption.
+	 */
+	private void savePluginStatesToConfig(Map<Plugin, Boolean> states)
+	{
+		if (states.isEmpty())
+		{
+			return;
+		}
+
+		configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_SAVED_STATES, encodePluginStates(states));
+	}
+
+	/**
+	 * Clears any saved plugin states from config.
+	 */
+	private void clearSavedPluginStates()
+	{
+		configManager.unsetConfiguration(CONFIG_GROUP, CONFIG_KEY_SAVED_STATES);
+	}
+
+	/**
+	 * Encodes a map of plugin states into a JSON string using Gson.
+	 */
+	private String encodePluginStates(Map<Plugin, Boolean> states)
+	{
+		Map<String, Boolean> classNameStates = new LinkedHashMap<>();
+		for (Map.Entry<Plugin, Boolean> entry : states.entrySet())
+		{
+			classNameStates.put(entry.getKey().getClass().getName(), entry.getValue());
+		}
+		return GSON.toJson(classNameStates);
+	}
+
+	/**
+	 * Decodes a plugin states JSON string back into a map.
+	 * Falls back to the legacy colon-delimited format for backward compatibility.
+	 */
+	private Map<String, Boolean> parsePluginStates(String encoded)
+	{
+		if (encoded.isEmpty())
+		{
+			return new HashMap<>();
+		}
+
+		try
+		{
+			Type type = new TypeToken<Map<String, Boolean>>(){}.getType();
+			Map<String, Boolean> result = GSON.fromJson(encoded, type);
+			return result != null ? result : new HashMap<>();
+		}
+		catch (Exception e)
+		{
+			// Fall back to legacy format: "ClassName:true,ClassName:false,..."
+			log.debug("Parsing plugin states with legacy format", e);
+			Map<String, Boolean> states = new HashMap<>();
+			String[] pairs = encoded.split(",");
+			for (String pair : pairs)
+			{
+				String[] parts = pair.split(":");
+				if (parts.length == 2)
+				{
+					states.put(parts[0], Boolean.parseBoolean(parts[1]));
+				}
+			}
+			return states;
+		}
+	}
+
+	/**
+	 * Restores plugin states from a map of class names to enabled state.
+	 */
+	private void restorePluginStatesFromMap(Map<String, Boolean> statesByClass)
+	{
+		for (Plugin plugin : pluginManager.getPlugins())
+		{
+			String className = plugin.getClass().getName();
+			if (statesByClass.containsKey(className))
+			{
+				boolean shouldBeEnabled = statesByClass.get(className);
+				boolean currentlyEnabled = pluginManager.isPluginEnabled(plugin);
+
+				if (shouldBeEnabled != currentlyEnabled)
+				{
+					setPluginState(plugin, shouldBeEnabled);
+				}
+			}
+		}
+	}
+
 	// -- Session lifecycle --
 
 	private void startSession()
 	{
+		if (session != null || operationInProgress)
+		{
+			return;
+		}
+
 		List<Plugin> candidates = collectCandidates();
 
 		Map<Plugin, Boolean> snapshot = new LinkedHashMap<>();
@@ -191,27 +356,43 @@ class PluginTroubleshooterPanel extends PluginPanel
 
 		session = new TroubleshooterSession(candidates, snapshot);
 
+		// Save plugin states for recovery in case of interruption
+		savePluginStatesToConfig(snapshot);
+
 		if (session.getState() == TroubleshooterState.NOT_FOUND)
 		{
 			session = null;
+			clearSavedPluginStates();
 			showTerminal("No plugins to troubleshoot",
 				"There are no active, user-toggleable plugins to test.");
 			return;
 		}
 
-		applySessionStep();
-		buildRunningCard();
-		showCard(CARD_RUNNING);
+		runPluginOpsInBackground(
+			this::applySessionStep,
+			() ->
+			{
+				buildRunningCard();
+				showCard(CARD_RUNNING);
+			});
 	}
 
 	private void advanceBad()
 	{
+		if (operationInProgress)
+		{
+			return;
+		}
 		session.reportBad();
 		afterAdvance();
 	}
 
 	private void advanceGood()
 	{
+		if (operationInProgress)
+		{
+			return;
+		}
 		session.reportGood();
 		afterAdvance();
 	}
@@ -221,44 +402,74 @@ class PluginTroubleshooterPanel extends PluginPanel
 		switch (session.getState())
 		{
 			case FOUND:
-				restoreExcept(session.getResult());
-				buildFoundCard();
-				showCard(CARD_FOUND);
+				runPluginOpsInBackground(
+					() -> restoreExcept(session.getResult()),
+					() ->
+					{
+						clearSavedPluginStates();
+						buildFoundCard();
+						showCard(CARD_FOUND);
+					});
 				break;
 
 			case NOT_FOUND:
-				restoreAll();
-				session = null;
-				showTerminal("Could not identify the problem",
-					"<html>The troubleshooter could not narrow it down to a"
-						+ " single plugin. This can happen when multiple plugins"
-						+ " interact to cause the issue.<br><br>"
-						+ "Try running the troubleshooter again, or ask for help"
-						+ " on the RuneLite Discord.</html>");
+				runPluginOpsInBackground(
+					this::restoreAll,
+					() ->
+					{
+						clearSavedPluginStates();
+						session = null;
+						showTerminal("Could not identify the problem",
+							"<html>The troubleshooter could not narrow it down to a"
+								+ " single plugin. This can happen when multiple plugins"
+								+ " interact to cause the issue.<br><br>"
+								+ "Try running the troubleshooter again, or ask for help"
+								+ " on the RuneLite Discord.</html>");
+					});
 				break;
 
 			default:
-				applySessionStep();
-				buildRunningCard();
-				showCard(CARD_RUNNING);
+				runPluginOpsInBackground(
+					this::applySessionStep,
+					() ->
+					{
+						buildRunningCard();
+						showCard(CARD_RUNNING);
+					});
 				break;
 		}
 	}
 
 	private void cancelSession()
 	{
+		if (operationInProgress)
+		{
+			return;
+		}
+
 		if (session != null)
 		{
 			session.cancel();
-			restoreAll();
-			session = null;
+			runPluginOpsInBackground(
+				this::restoreAll,
+				() ->
+				{
+					clearSavedPluginStates();
+					session = null;
+					rebuildIdleCard();
+					showCard(CARD_IDLE);
+				});
 		}
-		rebuildIdleCard();
-		showCard(CARD_IDLE);
+		else
+		{
+			rebuildIdleCard();
+			showCard(CARD_IDLE);
+		}
 	}
 
 	private void finishKeepDisabled()
 	{
+		clearSavedPluginStates();
 		session = null;
 		rebuildIdleCard();
 		showCard(CARD_IDLE);
@@ -266,10 +477,20 @@ class PluginTroubleshooterPanel extends PluginPanel
 
 	private void finishReenableAll()
 	{
-		restoreAll();
-		session = null;
-		rebuildIdleCard();
-		showCard(CARD_IDLE);
+		if (operationInProgress)
+		{
+			return;
+		}
+
+		runPluginOpsInBackground(
+			this::restoreAll,
+			() ->
+			{
+				clearSavedPluginStates();
+				session = null;
+				rebuildIdleCard();
+				showCard(CARD_IDLE);
+			});
 	}
 
 	// -- Candidate collection --
@@ -326,30 +547,57 @@ class PluginTroubleshooterPanel extends PluginPanel
 			.collect(Collectors.toList());
 	}
 
-	private long countCandidates()
-	{
-		Set<Class<? extends Plugin>> dependencyRoots = getDependencyRoots();
-
-		return pluginManager.getPlugins().stream()
-			.filter(pluginManager::isPluginActive)
-			.filter(p -> isTroubleshootable(p, dependencyRoots))
-			.count();
-	}
 
 	// -- Plugin state management --
 
+	/**
+	 * Applies plugin states for the current bisect step.
+	 * <p>
+	 * Proper bisect behaviour:
+	 * <ul>
+	 *   <li>Suspects in the enabled half {@code [low, mid]} — kept enabled</li>
+	 *   <li>Suspects in the disabled half {@code (mid, high]} — disabled for testing</li>
+	 *   <li>Suspects outside the current range — already cleared, re-enabled
+	 *       (restored to original state)</li>
+	 * </ul>
+	 */
 	private void applySessionStep()
 	{
-		Set<Plugin> enabled = new HashSet<>(session.getEnabledHalf());
+		int low = session.getLow();
+		int high = session.getHigh();
+		int mid = session.getMid();
+		List<Plugin> suspects = session.getSuspects();
 
-		for (Plugin plugin : session.getSuspects())
+		for (int i = 0; i < suspects.size(); i++)
 		{
-			boolean wantEnabled = enabled.contains(plugin);
-			boolean isActive = pluginManager.isPluginActive(plugin);
+			Plugin plugin = suspects.get(i);
+			boolean isEnabled = pluginManager.isPluginEnabled(plugin);
 
-			if (wantEnabled != isActive)
+			if (i < low || i > high)
 			{
-				setPluginState(plugin, wantEnabled);
+				// Outside current search range — cleared, restore to original
+				Boolean originalState = session.getOriginalStates().get(plugin);
+				boolean shouldBeEnabled = originalState != null && originalState;
+				if (shouldBeEnabled != isEnabled)
+				{
+					setPluginState(plugin, shouldBeEnabled);
+				}
+			}
+			else if (i <= mid)
+			{
+				// Enabled half [low, mid] — should be on
+				if (!isEnabled)
+				{
+					setPluginState(plugin, true);
+				}
+			}
+			else
+			{
+				// Disabled half (mid, high] — should be off
+				if (isEnabled)
+				{
+					setPluginState(plugin, false);
+				}
 			}
 		}
 	}
@@ -364,9 +612,9 @@ class PluginTroubleshooterPanel extends PluginPanel
 		for (Map.Entry<Plugin, Boolean> entry : session.getOriginalStates().entrySet())
 		{
 			boolean wasEnabled = entry.getValue();
-			boolean isActive = pluginManager.isPluginActive(entry.getKey());
+			boolean isEnabled = pluginManager.isPluginEnabled(entry.getKey());
 
-			if (wasEnabled != isActive)
+			if (wasEnabled != isEnabled)
 			{
 				setPluginState(entry.getKey(), wasEnabled);
 			}
@@ -383,22 +631,56 @@ class PluginTroubleshooterPanel extends PluginPanel
 		for (Map.Entry<Plugin, Boolean> entry : session.getOriginalStates().entrySet())
 		{
 			Plugin plugin = entry.getKey();
-			boolean isActive = pluginManager.isPluginActive(plugin);
+			boolean isEnabled = pluginManager.isPluginEnabled(plugin);
 
 			if (plugin == exclude)
 			{
-				if (isActive)
+				if (isEnabled)
 				{
 					setPluginState(plugin, false);
 				}
 				continue;
 			}
 
-			if (entry.getValue() != isActive)
+			if (entry.getValue() != isEnabled)
 			{
 				setPluginState(plugin, entry.getValue());
 			}
 		}
+	}
+
+	/**
+	 * Runs plugin operations on a background thread to avoid blocking the EDT,
+	 * then executes the given callback on the EDT when complete.
+	 * Sets {@link #operationInProgress} to prevent re-entrant clicks.
+	 */
+	private void runPluginOpsInBackground(Runnable pluginOps, Runnable edtCallback)
+	{
+		operationInProgress = true;
+		new SwingWorker<Void, Void>()
+		{
+			@Override
+			protected Void doInBackground()
+			{
+				pluginOps.run();
+				return null;
+			}
+
+			@Override
+			protected void done()
+			{
+				try
+				{
+					get();
+				}
+				catch (Exception e)
+				{
+					log.warn("Background plugin operation failed", e);
+				}
+				operationInProgress = false;
+				edtCallback.run();
+			}
+		}.execute();
 	}
 
 	private void setPluginState(Plugin plugin, boolean enabled)
@@ -463,20 +745,21 @@ class PluginTroubleshooterPanel extends PluginPanel
 		panel.add(createWrappedLabel(
 			"<html>Having a problem? This tool helps you quickly"
 				+ " find which plugin is causing it.<br><br>"
-				+ "<b>How it works:</b><br>"
+				+ "How it works:<br>"
 				+ "1. Some plugins will be temporarily disabled<br>"
 				+ "2. You check if the issue still occurs<br>"
 				+ "3. We repeat until the culprit is found</html>"));
 		panel.add(Box.createVerticalStrut(16));
 
-		long candidateCount = countCandidates();
-		int estimatedSteps = TroubleshooterSession.computeTotalSteps((int) candidateCount);
+		List<Plugin> candidates = collectCandidates();
+		int candidateCount = candidates.size();
+		int estimatedSteps = TroubleshooterSession.computeTotalSteps(candidateCount);
 
 		JLabel stats = createWrappedLabel(
-			"<html><b>" + candidateCount + "</b> plugin"
+			"<html>" + candidateCount + " plugin"
 				+ (candidateCount != 1 ? "s are" : " is")
 				+ " currently active.<br>"
-				+ "Estimated steps: <b>" + estimatedSteps + "</b></html>");
+				+ "Estimated steps: " + estimatedSteps + "</html>");
 		stats.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
 		panel.add(stats);
 		panel.add(Box.createVerticalStrut(20));
@@ -511,13 +794,23 @@ class PluginTroubleshooterPanel extends PluginPanel
 		// Enabled/disabled counts
 		List<Plugin> enabledPlugins = session.getEnabledHalf();
 		List<Plugin> disabledPlugins = session.getDisabledHalf();
+		int remaining = enabledPlugins.size() + disabledPlugins.size();
+		int cleared = session.getSuspects().size() - remaining;
 
-		JLabel info = createWrappedLabel(
-			"<html><b>" + enabledPlugins.size() + "</b> plugin"
-				+ (enabledPlugins.size() != 1 ? "s" : "")
-				+ " enabled, <b>" + disabledPlugins.size() + "</b> disabled"
-				+ " for this test.<br><br>"
-				+ "Try to reproduce the issue now.</html>");
+		StringBuilder infoHtml = new StringBuilder("<html>");
+		infoHtml.append("<b>").append(remaining).append("</b> suspect")
+			.append(remaining != 1 ? "s" : "")
+			.append(" remaining: <b>").append(enabledPlugins.size()).append("</b> enabled, <b>")
+			.append(disabledPlugins.size()).append("</b> disabled for this test.");
+		if (cleared > 0)
+		{
+			infoHtml.append("<br><b>").append(cleared).append("</b> cleared plugin")
+				.append(cleared != 1 ? "s" : "")
+				.append(" re-enabled.");
+		}
+		infoHtml.append("<br><br>Try to reproduce the issue now.</html>");
+
+		JLabel info = createWrappedLabel(infoHtml.toString());
 		runningCard.add(info);
 		runningCard.add(Box.createVerticalStrut(12));
 
@@ -545,10 +838,13 @@ class PluginTroubleshooterPanel extends PluginPanel
 		runningCard.add(cancelButton);
 		runningCard.add(Box.createVerticalStrut(16));
 
-		// Plugin lists
-		addPluginList(runningCard, "Enabled plugins:", enabledPlugins, ColorScheme.PROGRESS_COMPLETE_COLOR);
-		runningCard.add(Box.createVerticalStrut(8));
-		addPluginList(runningCard, "Disabled plugins:", disabledPlugins, COLOR_BAD);
+		// Plugin lists (hidden by default, toggled via config)
+		if (config.showPluginLists())
+		{
+			addPluginList(runningCard, "Enabled suspects:", enabledPlugins, ColorScheme.PROGRESS_COMPLETE_COLOR);
+			runningCard.add(Box.createVerticalStrut(8));
+			addPluginList(runningCard, "Disabled suspects:", disabledPlugins, COLOR_BAD);
+		}
 
 		cardContainer.add(runningCard, CARD_RUNNING);
 	}
@@ -565,7 +861,7 @@ class PluginTroubleshooterPanel extends PluginPanel
 		foundCard = createBasePanel();
 		Plugin result = session.getResult();
 
-		JLabel title = createTitle("\u2705 Found the problem!");
+		JLabel title = createTitle("Found the problem!");
 		title.setForeground(ColorScheme.PROGRESS_COMPLETE_COLOR);
 		foundCard.add(title);
 		foundCard.add(Box.createVerticalStrut(12));
@@ -738,16 +1034,30 @@ class PluginTroubleshooterPanel extends PluginPanel
 		list.setLayout(new BoxLayout(list, BoxLayout.Y_AXIS));
 		list.setBackground(ColorScheme.DARKER_GRAY_COLOR);
 		list.setBorder(new EmptyBorder(6, 8, 6, 8));
-		list.setAlignmentX(LEFT_ALIGNMENT);
 
 		for (Plugin p : plugins)
 		{
-			JLabel pluginLabel = new JLabel("\u2022 " + p.getName());
+			JLabel pluginLabel = new JLabel("- " + p.getName());
 			pluginLabel.setForeground(bulletColor);
 			pluginLabel.setFont(FontManager.getRunescapeSmallFont());
 			list.add(pluginLabel);
 		}
 
-		parent.add(list);
+		JScrollPane scrollPane = new JScrollPane(list);
+		scrollPane.setAlignmentX(LEFT_ALIGNMENT);
+		scrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+		scrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
+		scrollPane.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		scrollPane.getViewport().setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		scrollPane.setBorder(null);
+
+		// Cap height at 150px so the panel doesn't grow unbounded
+		int maxHeight = 150;
+		Dimension listPref = list.getPreferredSize();
+		int height = Math.min(listPref.height, maxHeight);
+		scrollPane.setPreferredSize(new Dimension(0, height));
+		scrollPane.setMaximumSize(new Dimension(Integer.MAX_VALUE, maxHeight));
+
+		parent.add(scrollPane);
 	}
 }

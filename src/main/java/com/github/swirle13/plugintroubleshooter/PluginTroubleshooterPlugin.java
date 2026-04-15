@@ -1,3 +1,4 @@
+
 /*
  * Copyright (c) 2026, swirle13
  * All rights reserved.
@@ -26,6 +27,8 @@ package com.github.swirle13.plugintroubleshooter;
 
 import java.awt.image.BufferedImage;
 import javax.inject.Inject;
+import com.google.inject.Provides;
+import net.runelite.client.config.ConfigManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.ClientToolbar;
@@ -46,6 +49,12 @@ public class PluginTroubleshooterPlugin extends Plugin
 	private NavigationButton navButton;
 	private PluginTroubleshooterPanel panel;
 
+	@Provides
+	PluginTroubleshooterConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(PluginTroubleshooterConfig.class);
+	}
+
 	@Override
 	protected void startUp()
 	{
@@ -62,13 +71,21 @@ public class PluginTroubleshooterPlugin extends Plugin
 			.build();
 
 		clientToolbar.addNavigation(navButton);
+		panel.registerEventBus();
 	}
 
 	@Override
 	protected void shutDown()
 	{
-		panel.shutdown();
-		clientToolbar.removeNavigation(navButton);
+		if (panel != null)
+		{
+			panel.unregisterEventBus();
+			panel.shutdown();
+		}
+		if (navButton != null)
+		{
+			clientToolbar.removeNavigation(navButton);
+		}
 	}
 }
 
